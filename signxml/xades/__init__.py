@@ -356,7 +356,7 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
                 ),
                 DS.DigestValue(
                     self._get_digest(
-                        cert.public_bytes(Encoding.DER),
+                        cert.digest(self.digest_alg),
                         self._get_digest_method_by_tag(self.digest_alg)
                     )
                 )
