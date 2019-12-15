@@ -13,6 +13,7 @@ from lxml.etree import Element, SubElement
 from lxml.builder import ElementMaker
 from defusedxml.lxml import fromstring
 
+from OpenSSL.crypto import X509Name
 from cryptography.hazmat.primitives.asymmetric import rsa, dsa, ec
 from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
 from cryptography.hazmat.primitives.hashes import Hash, SHA1, SHA224, SHA256, SHA384, SHA512
@@ -68,6 +69,17 @@ def resolve_uri(uri):
         return requests.get(uri).content
     except:
         raise InvalidInput(f"Unable to resolve reference URI: {uri}")
+
+
+class X509NamePKCS12(X509Name):
+    def _issuer_string(self):
+        x509name = self.get_components()
+        x509name.reverse()
+        return ",".join([f"{var.decode()}={alias.decode()}" for var, alias in x509name])
+
+
+def issuer_string(certificate):
+    return X509NamePKCS12(certificate.get_issuer())._issuer_string()
 
 
 class XAdESProcessor(XMLSignatureProcessor):
@@ -326,12 +338,9 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
                 encoding of one DER-encoded instance of type IssuerSerial type
                 defined in IETF RFC 5035 [17].
                 """
-                raise NotImplementedError(
-                    "Please make a PR if you know how to obtain in python a "
-                    "'DER-encoded instance of type IssuerSerial type defined in "
-                    "IETF RFC 5035'")
                 serial_element = XADES132.IssuerSerialV2(
-                    # TODO implement, wtf?
+                    DS.X09IssuerName(issuer_string(cert)),
+                    DS.X509SerialNumber(f"cert.get_serial_number()")
                 )
             """
             The element CertDigest shall contain the digest of the referenced
