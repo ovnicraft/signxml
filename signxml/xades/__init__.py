@@ -356,7 +356,7 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
                 ),
                 DS.DigestValue(
                     self._get_digest(
-                        cert.digest(self.digest_alg),
+                        b64encode(cert.digest(self.digest_alg)),
                         self._get_digest_method_by_tag(self.digest_alg)
                     )
                 )
@@ -393,43 +393,6 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
             elements.append(XADES132.SignatureProductionPlace(*pp_elements))  # deprecated (legacy)
         elif pp_elements:
             elements.append(XADES132.SignatureProductionPlaceV2(*pp_elements))
-
-        # Item 4: SignaturePolicyIdentifier
-        """
-        The SignaturePolicyIdentifier qualifying property shall be a signed
-            qualifying property qualifying the signature.
-        The SignaturePolicyIdentifier qualifying property shall contain either
-            an explicit identifier of a signature policy or an indication that
-            there is an implied signature policy that the relying party should
-            be aware of.
-
-        ETSI TS 119 172-1 specifies a framework for signature policies.
-        """
-        spid_elements = []
-        sp = options_struct.SignaturePolicy
-        # digest method
-        pdm = self.known_digest_tags.get(self.digest_alg)
-        # digest value
-        pv = resolve_uri(sp.Identifier)
-        
-        spid_elements.append(
-            XADES132.SigPolicyId(
-                XADES132.Identifier(sp.Identifier),
-                XADES132.Description(sp.Description)
-            )
-        )
-        spid_elements.append(
-            XADES132.SigPolicyHash(
-                DS.DigestMethod(Algorithm=pdm),
-                DS.DigestValue(
-                    self._get_digest(pv,self._get_digest_method_by_tag(self.digest_alg))
-                )
-            )
-        )
-        spid = XADES132.SignaturePolicyId(*spid_elements)
-        spi_elements = []
-        spi_elements.append(spid)
-        elements.append(XADES132.SignaturePolicyIdentifier(*spi_elements))
 
         # Item 5: SignerRole or SignerRoleV2
         """
@@ -610,6 +573,37 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
           up     := UnsignedProperties,             c. 4.3.3
             usp  := UnignedSignatureProperties,     c. 4.3.6
             udop := UnignedDataObjectProperties,    c. 4.3.7
+
+        Electronic signature forms elements
+        Mention differences between nodes
+        XaDES-BES
+        ssp:
+            (SigningTime)?
+            (SigningCertificate)?
+            (SignatureProductionPlace)?
+            (SignerRole)?
+
+        XaDES-EPES:
+        ssp:
+            (SigningTime)?
+            (SigningCertificate)?
+            (SignaturePolicyIdentifier)
+            (SignatureProductionPlace)?
+            (SignerRole)?
+
+        XaDES-T:
+        usp:
+            (CounterSignature)*
+            (SignatureTimeStamp)+
+
+        XaDES-C:
+        usp:
+            (CounterSignature)
+            (SignatureTimeStamp)
+            (CompleteCertificateRefs)
+            (CompleteRevocationRefs)
+            (AttributeCertificateRefs)?
+            (AttributeRevocationRefs)?
         """
 
         ssp_elements = self._generate_xades_ssp_elements(options_struct)
@@ -730,3 +724,46 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
         if not qp_elements:
             return None
         return XADES132.QualifyingProperties(*qp_elements, **qp_attributes)
+
+
+class XAdESEPESSigner(XAdESSigner):
+
+    def _generate_xades_ssp_elements(self, options_struct):
+        # Item 4: SignaturePolicyIdentifier
+        """
+        The SignaturePolicyIdentifier qualifying property shall be a signed
+            qualifying property qualifying the signature.
+        The SignaturePolicyIdentifier qualifying property shall contain either
+            an explicit identifier of a signature policy or an indication that
+            there is an implied signature policy that the relying party should
+            be aware of.
+
+        ETSI TS 119 172-1 specifies a framework for signature policies.
+        """
+        elements = super(XAdESEPESSigner, self)._generate_xades_ssp_elements(options_struct)
+        spid_elements = []
+        sp = options_struct.SignaturePolicy
+        # digest method
+        pdm = self.known_digest_tags.get(self.digest_alg)
+        # digest value
+        pv = resolve_uri(sp.Identifier)
+
+        spid_elements.append(
+            XADES132.SigPolicyId(
+                XADES132.Identifier(sp.Identifier),
+                XADES132.Description(sp.Description)
+            )
+        )
+        spid_elements.append(
+            XADES132.SigPolicyHash(
+                DS.DigestMethod(Algorithm=pdm),
+                DS.DigestValue(
+                    self._get_digest(pv,self._get_digest_method_by_tag(self.digest_alg))
+                )
+            )
+        )
+        spid = XADES132.SignaturePolicyId(*spid_elements)
+        spi_elements = []
+        spi_elements.append(spid)
+        elements.append(XADES132.SignaturePolicyIdentifier(*spi_elements))
+        return elements
