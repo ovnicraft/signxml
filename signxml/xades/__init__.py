@@ -14,6 +14,8 @@ from lxml.builder import ElementMaker
 from defusedxml.lxml import fromstring
 
 from OpenSSL.crypto import X509Name
+
+from cryptography.hazmat import _der
 from cryptography.hazmat.primitives.asymmetric import rsa, dsa, ec
 from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
 from cryptography.hazmat.primitives.hashes import Hash, SHA1, SHA224, SHA256, SHA384, SHA512
@@ -339,8 +341,7 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
                 defined in IETF RFC 5035 [17].
                 """
                 serial_element = XADES132.IssuerSerialV2(
-                    DS.X09IssuerName(issuer_string(cert)),
-                    DS.X509SerialNumber(f"cert.get_serial_number()")
+                    b64encode(_der.encode_der_integer(cert.get_serial_number()))
                 )
             """
             The element CertDigest shall contain the digest of the referenced
