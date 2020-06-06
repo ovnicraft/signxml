@@ -2,6 +2,7 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 from base64 import b64encode, b64decode
 from enum import Enum
+import re
 
 from eight import str, bytes
 from lxml import etree
@@ -279,6 +280,10 @@ class XMLSigner(XMLSignatureProcessor):
         self.c14n_alg = c14n_algorithm
         self.namespaces = dict(ds=namespaces.ds)
         self._parser = None
+        """
+        List of built references to incorporate to the element ds:SignedInfo
+        """
+        self.refs = []
 
     def sign(self, data, key=None, passphrase=None, cert=None, reference_uri=None, key_name=None, key_info=None,
              id_attribute=None):
@@ -308,7 +313,7 @@ class XMLSigner(XMLSignatureProcessor):
             Custom reference URI or list of reference URIs to incorporate into the signature. When ``method`` is set to
             ``detached`` or ``enveloped``, reference URIs are set to this value and only the referenced elements are
             signed.
-        :type reference_uri: string or list
+        :type reference_uri: string or list or XML ElementTree Element
         :param key_name: Add a KeyName element in the KeyInfo element that may be used by the signer to communicate a
             key identifier to the recipient. Typically, KeyName contains an identifier related to the key pair used to
             sign the message.
@@ -343,7 +348,8 @@ class XMLSigner(XMLSignatureProcessor):
             reference_uris = reference_uri
 
         sig_root, doc_root, c14n_inputs, reference_uris = self._unpack(data, reference_uris)
-        signed_info_element, signature_value_element = self._build_sig(sig_root, reference_uris, c14n_inputs)
+        doc_root, sig_root, reference_uris, c14n_inputs = self._pre_build_sig(doc_root, sig_root, reference_uris, c14n_inputs)
+        signed_info_element, signature_value_element = self._build_sig(doc_root, sig_root, reference_uris, c14n_inputs)
 
         if key is None:
             raise InvalidInput('Parameter "key" is required')
@@ -400,6 +406,10 @@ class XMLSigner(XMLSignatureProcessor):
                             x509_certificate.text = strip_pem_header(dump_certificate(FILETYPE_PEM, cert))
             else:
                 sig_root.append(key_info)
+
+            #ensure the right order of elements
+            doc_root, sig_root, c14n_inputs = self._sort_elements(
+                doc_root, sig_root, c14n_inputs)
         else:
             raise NotImplementedError()
 
@@ -467,7 +477,62 @@ class XMLSigner(XMLSignatureProcessor):
             reference_uris = ["#object"]
         return sig_root, doc_root, c14n_inputs, reference_uris
 
-    def _build_sig(self, sig_root, reference_uris, c14n_inputs):
+    def _pre_build_sig(self, doc_root, sig_root, reference_uris, c14n_inputs):
+        """
+        To overwrite
+        
+        By default, this method add self.refs to reference_uris, elements 
+        ready to incorporate into sig_root without changes
+
+        Use cases:
+        - Set the attribute 'Id' of the element 'Signature' when the
+            in the _unpack function the attribute is deleted, this will override 
+            the digest value of built references
+        - Add the refs and c14_inputs to preserve the validation
+        exmple:
+
+        query = doc_root.xpath(
+            f"//{xades_ns}:QualifyingProperties", namespaces=namespaces
+        )
+        if len(query) > 1:
+            raise NotImplementedError("Multiple QualifyingProperties")
+        sig_id = query[0].attrib["Target"]
+        if sig_id.startswith("#"):
+            sig_id = sig_id.replace("#", "")
+        sig_root.set("Id", sig_id)
+        for ref in self.refs:
+            reference_uris.append(ref)
+            uri = ref
+            if etree.iselement(ref):
+                uri = uri.attrib["URI"]
+            c14n_inputs.append(
+                self.get_root(self._resolve_reference(doc_root, {"URI": uri}))
+            )
+        """
+        return doc_root, sig_root, reference_uris, c14n_inputs
+
+
+    def _build_sig(self, doc_root, sig_root, reference_uris, c14n_inputs):
+        """
+        :param reference_uris: the references to include o buld.
+        :cases:
+        - elements: if the reference_uri is an element, this will be added 
+          without modifications
+        - dict: if the reference_uri is a dict, the reference element will be 
+          created using the attributes in the dict
+          i.e: {"URI": URI, "Type": Type, "Id": ID}
+        - string: if refence_uri is a string, this will be interpreted as the 
+          attribute `URI` 
+        """
+        def _check_brothers(element1, element2):
+            """helper method to determiante if two elements have the same tag
+               :param element1: element
+               :type element1: etree._Element
+               :param element2: elemnt
+               :type element2: etree._Element
+            """
+            return element1.tag == element2.tag
+
         signed_info = SubElement(sig_root, ds_tag("SignedInfo"), nsmap=self.namespaces)
         c14n_method = SubElement(signed_info, ds_tag("CanonicalizationMethod"), Algorithm=self.c14n_alg)
         if self.sign_alg.startswith("hmac-"):
@@ -476,19 +541,40 @@ class XMLSigner(XMLSignatureProcessor):
             algorithm_id = self.known_signature_digest_tags[self.sign_alg]
         signature_method = SubElement(signed_info, ds_tag("SignatureMethod"), Algorithm=algorithm_id)
         for i, reference_uri in enumerate(reference_uris):
-            reference = SubElement(signed_info, ds_tag("Reference"), URI=reference_uri)
-            if self.method == methods.enveloped:
-                transforms = SubElement(reference, ds_tag("Transforms"))
-                SubElement(transforms, ds_tag("Transform"), Algorithm=namespaces.ds + "enveloped-signature")
-                SubElement(transforms, ds_tag("Transform"), Algorithm=self.c14n_alg)
-            digest_method = SubElement(reference, ds_tag("DigestMethod"),
-                                       Algorithm=self.known_digest_tags[self.digest_alg])
-            digest_value = SubElement(reference, ds_tag("DigestValue"))
-            payload_c14n = self._c14n(c14n_inputs[i], algorithm=self.c14n_alg)
-            digest = self._get_digest(payload_c14n, self._get_digest_method_by_tag(self.digest_alg))
-            digest_value.text = digest
+            if etree.iselement(reference_uri):
+                # adding built references
+                signed_info.append(reference_uri)
+            else:
+                if isinstance(reference_uri, dict):
+                    reference = SubElement(signed_info, ds_tag("Reference"), **reference_uri)
+                else:
+                    reference = SubElement(signed_info, ds_tag("Reference"), URI=reference_uri)
+
+                if self.method == methods.enveloped:
+                    transforms = SubElement(reference, ds_tag("Transforms"))
+                    if _check_brothers(doc_root, c14n_inputs[i]):
+                        SubElement(transforms, ds_tag("Transform"), Algorithm=namespaces.ds + "enveloped-signature")
+                    SubElement(transforms, ds_tag("Transform"), Algorithm=self.c14n_alg)
+                digest_method = SubElement(reference, ds_tag("DigestMethod"),
+                                           Algorithm=self.known_digest_tags[self.digest_alg])
+                digest_value = SubElement(reference, ds_tag("DigestValue"))
+                payload_c14n = self._c14n(c14n_inputs[i], algorithm=self.c14n_alg)
+                digest = self._get_digest(payload_c14n, self._get_digest_method_by_tag(self.digest_alg))
+                digest_value.text = digest
         signature_value = SubElement(sig_root, ds_tag("SignatureValue"))
         return signed_info, signature_value
+
+    def _sort_elements(self, doc_root, sig_root, c14n_inputs):
+        """
+        This method is implemented to preserve the order in signature structure
+        case: If one or more elements are in the element "Signature" before 
+        appending SignedInfo, SignatureValue and KeyInfo, the structure's order
+        will be corrupted once them have been added.
+        """
+        ds_object = doc_root.xpath("//ds:Object", namespaces=namespaces)[0]
+        sig_root.insert(len(sig_root), ds_object)
+
+        return doc_root, sig_root, c14n_inputs
 
     def _serialize_key_value(self, key, key_info_element):
         key_value = SubElement(key_info_element, ds_tag("KeyValue"))

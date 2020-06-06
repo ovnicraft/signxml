@@ -6,6 +6,7 @@ from uuid import uuid4
 from datetime import datetime
 import pytz
 import requests
+import re
 
 from eight import str, bytes
 from lxml import etree
@@ -49,18 +50,32 @@ levels = Enum("Levels", "B T LT LTA")
 namespaces.update(Namespace(
     # xades111="https://uri.etsi.org/01903/v1.1.1#",  # superseded
     # xades122="https://uri.etsi.org/01903/v1.2.2#",  # superseded
-    xades132="https://uri.etsi.org/01903/v1.3.2#",
-    xades141="https://uri.etsi.org/01903/v1.4.1#",
+    xades="http://uri.etsi.org/01903/v1.3.2#",
+    xades141="http://uri.etsi.org/01903/v1.4.1#",
 ))
 
-XADES132 = ElementMaker(namespace=namespaces.xades132)
-XADES141 = ElementMaker(namespace=namespaces.xades141)
-DS = ElementMaker(namespace=namespaces.ds)
+XADES = ElementMaker(namespace=namespaces.xades, nsmap=namespaces)
+XADES141 = ElementMaker(namespace=namespaces.xades141, nsmap=namespaces)
+DS = ElementMaker(namespace=namespaces.ds, nsmap=namespaces)
 
 # helper functions
 
-def _gen_id(prefix, suffix):
-    return "{prefix}-{uid}-{suffix}".format(prefix=prefix, uid=uuid4(), suffix=suffix)
+class X509NamePKCS12(X509Name):
+    def _issuer_string(self):
+        x509name = self.get_components()
+        x509name.reverse()
+        return ",".join([f"{var.decode()}={alias.decode()}" for var, alias in x509name])
+
+def issuer_string(certificate):
+    return X509NamePKCS12(certificate.get_issuer())._issuer_string()
+
+def _gen_id(prefix, suffix=None):
+    """
+    Generates the id 
+    """
+    suffix = "-{}".format(suffix) if suffix else ""
+
+    return "{prefix}-{uid}{suffix}".format(prefix=prefix, uid=uuid4(), suffix=suffix)
 
 
 def resolve_uri(uri):
@@ -71,18 +86,6 @@ def resolve_uri(uri):
         return requests.get(uri).content
     except:
         raise InvalidInput(f"Unable to resolve reference URI: {uri}")
-
-
-class X509NamePKCS12(X509Name):
-    def _issuer_string(self):
-        x509name = self.get_components()
-        x509name.reverse()
-        return ",".join([f"{var.decode()}={alias.decode()}" for var, alias in x509name])
-
-
-def issuer_string(certificate):
-    return X509NamePKCS12(certificate.get_issuer())._issuer_string()
-
 
 class XAdESProcessor(XMLSignatureProcessor):
     schema_file = "v1.4.1/XAdES01903v141-201601.xsd"
@@ -103,7 +106,7 @@ class XAdESProcessor(XMLSignatureProcessor):
                 results = doc_root.xpath(xpath_query, uri=uri.lstrip("#"))
                 if len(results) > 1:
                     raise InvalidInput("Ambiguous reference URI {} resolved to {} nodes".format(uri, len(results)))
-                elif len(results) == 1:
+                elif len(results) == 1: 
                     return results[0]
         raise InvalidInput("Unable to resolve reference URI: {}".format(uri))
 
@@ -161,11 +164,12 @@ class SignaturePolicy(namedtuple(
     """
 
 class SignerOptions(namedtuple(
-    "SignerOptions", "CertChain ProductionPlace SignaturePolicy ClaimedRoles CertifiedRoles SignedAssertions",
+    "SignerOptions", 
+    "CertChain ProductionPlace SignaturePolicy ClaimedRoles CertifiedRoles SignedAssertions",
     {
-        'ClaimedRoles': [],
-        'CertifiedRoles': [],
-        'SignedAssertions': [],
+        "ClaimedRoles": [],
+        "CertifiedRoles": [],
+        "SignedAssertions": [],
     }
 )):
     """
@@ -208,64 +212,46 @@ class SignerOptions(namedtuple(
         application definition for representation of signed assertions
     """
 
-
 class XAdESSigner(XAdESProcessor, XMLSigner):
     """
     ...
     """
 
-    def __init__(self, level=levels.LTA, legacy=False, tz=pytz.utc):
+    def __init__(self, level=levels.LTA, legacy=False, tz=pytz.utc, black_list=list()):
         self.xades_legacy = legacy
         self.xades_level = level
         self.xades_tz = tz
         self.refs = []
         self.dsig_prefix = "xmldsig"
+        self.black_list = black_list
         super().__init__()
-
-    def sign(self, *args, **kwargs):
-        """
-        building the SignerOptions using kwargs values
-        """
-        place = ProductionPlace(
-            kwargs.get("city"),
-            kwargs.get("address"),
-            kwargs.get("state"),
-            kwargs.get("postal_code"),
-            kwargs.get("country"),
-        )
-        policy = SignaturePolicy(
-            kwargs.get("pidentifier"),
-            kwargs.get("pdescription"),
-        )
-        cert = kwargs.get("cert")
-        if isinstance(cert, (str, bytes)):
-            cert = list(iterate_pem(cert))
-        else:
-            cert = [cert]
-        # keeping the original kwargs to be sent to the original method 'sign'
-        vnames = XMLSigner.sign.__code__.co_varnames
-        old_kws = kwargs
-        kwargs = dict()
-        kwargs["cert"] = cert
-        vnames = list(vnames)
-        vnames.remove("cert")
-        vnames = tuple(vnames)
-        for i in range(0,len(vnames)):
-            key = vnames[i]
-            if old_kws.get(key) is not None:
-                kwargs[key] = old_kws.get(key)
-        options_struct = SignerOptions(cert, place, policy)
-        qualified_properties = self._sign(options_struct)
-        return super().sign(*args, **kwargs)
 
     def _sign(self, options_struct):
         """
         Returns the qualified properties
         """
-        self.refs #TODO: include refs in the signature info
         return DS.Object(self._generate_xades(options_struct))
 
-    def _add_xades_reference(self, sp):
+    def _clean_elements_from_black_list(self, elements):
+        """
+        :param black_list:
+            the list of tag elements that will be removed
+        :type black_list:
+            :py:class:`list`
+        :param elemnts:
+            the list of elements to be checked in the black list
+        :type elements:
+            :py:class:`list` of etree.Element
+        :return clean elements
+        """
+        if not isinstance(elements, list):
+            elements = list(elements)
+
+        return list(filter(
+            lambda x: isinstance(x, etree._Element) and x.tag not in self.black_list, elements
+        ))
+
+    def _add_xades_reference(self, el, attrs={}):
         """
         The refs depends the xmldsig scheme,(https://www.w3.org/TR/xmldsig-core2/#sec-Overview)
         not the XADES scheme, therefore, those refs have to wait for the general element to be append to
@@ -276,24 +262,19 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
         (https://www.w3.org/TR/xmldsig-core2/#sec-o-Reference)
         This reference is made for compatibility mode v1 anv v2
         (https://www.w3.org/TR/xmldsig-core2/#sec-Compatibility-Mode-Examples)
-        """
-        self.refs.append(
-            DS.Reference(
-                DS.Transforms(DS.Transform(Algorithm=self.default_c14n_algorithm)),
-                DS.DigestMethod(
-                    Algorithm=self.known_digest_tags[self.digest_alg]
-                ),
-                DS.DigestValue(
-                    self._get_digest(
-                        self._c14n(sp, algorithm=self.c14n_alg),
-                        self._get_digest_method_by_tag(self.digest_alg)
-                    )
-                ),
-                Type="http://uri.etsi.org/01903#SignedProperties",
-                URI="#" + sp.get("Id")
-            )
-        )
+        :param el: element
+        :type el: etree.Element
+        :param attrs: attributes to set in the element 'DigestValue'
+        :type attrs: py:class:dict
 
+        Note: PLEASE!! take into account that the digest may differ in the 
+            validation process caused by the transforms and the namespaces applied
+        """
+        if attrs:
+            attrs["URI"] = "#" + el.get("Id")
+            self.refs.append(attrs)
+        else:
+            self.refs.append("#" + el.get("Id"))
 
     def _generate_xades_ssp_elements(self, options_struct):
         """
@@ -314,7 +295,7 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
         elements = []
 
         # Item 1: SigningTime
-        elements.append(XADES132.SigningTime(datetime.now(self.xades_tz).isoformat()))
+        elements.append(XADES.SigningTime(datetime.now(self.xades_tz).isoformat()))
 
         # Item 2: SigningCertificate or SigningCertificateV2
         """
@@ -330,7 +311,7 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
         cert_elements = []
         for cert in options_struct.CertChain:
             if self.xades_legacy:
-                serial_element = XADES132.IssuerSerial(
+                serial_element = XADES.IssuerSerial(
                     DS.X509IssuerName(cert.issuer.rfc4514_string()),
                     DS.X509SerialNumber(str(cert.serial_number)),
                 )
@@ -340,8 +321,12 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
                 encoding of one DER-encoded instance of type IssuerSerial type
                 defined in IETF RFC 5035 [17].
                 """
-                serial_element = XADES132.IssuerSerialV2(
-                    b64encode(_der.encode_der_integer(cert.get_serial_number()))
+                raise NotImplementedError(
+                    "Please make a PR if you know how to obtain in python a "
+                    "'DER-encoded instance of type IssuerSerial type defined in "
+                    "IETF RFC 5035'")
+                serial_element = XADES.IssuerSerialV2(
+                    # TODO implement, wtf?
                 )
             """
             The element CertDigest shall contain the digest of the referenced
@@ -351,23 +336,23 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
             2) ds:DigestValue element shall contain the base-64 encoded value
                of the digest computed on the DERencoded certificate.
             """
-            cert_digest = XADES132.CertDigest(
+            cert_digest = XADES.CertDigest(
                 DS.DigestMethod(
                     Algorithm=self.known_digest_tags[self.digest_alg]
                 ),
                 DS.DigestValue(
                     self._get_digest(
-                        b64encode(cert.digest(self.digest_alg)),
+                        cert.public_bytes(Encoding.DER),
                         self._get_digest_method_by_tag(self.digest_alg)
                     )
                 )
             )
-            cert_elements.append(XADES132.Cert(cert_digest, serial_element))
+            cert_elements.append(XADES.Cert(cert_digest, serial_element))
 
         if self.xades_legacy:
-            elements.append(XADES132.SigningCertificate(*cert_elements))  # deprecated (legacy)
+            elements.append(XADES.SigningCertificate(*cert_elements))  # deprecated (legacy)
         else:
-            elements.append(XADES132.SigningCertificateV2(*cert_elements))
+            elements.append(XADES.SigningCertificateV2(*cert_elements))
 
         # Item 3: SignatureProductionPlace or SignatureProductionPlaceV2
         """
@@ -380,20 +365,58 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
         pp_elements = []
         PP = options_struct.ProductionPlace
         pa = pp_elements.append
-        pa(XADES132.City(PP.City)) if PP.City else None
+        pa(XADES.City(PP.City)) if PP.City else None
         if not self.xades_legacy:
-            pa(XADES132.StreetAddress(PP.StreetAddress)) if PP.StreetAddress else None
-        pa(XADES132.StateOrProvince(PP.StateOrProvince)) if PP.StateOrProvince else None
-        pa(XADES132.PostalCode(PP.PostalCode)) if PP.PostalCode else None
-        pa(XADES132.CountryName(PP.CountryName)) if PP.CountryName else None
+            pa(XADES.StreetAddress(PP.StreetAddress)) if PP.StreetAddress else None
+        pa(XADES.StateOrProvince(PP.StateOrProvince)) if PP.StateOrProvince else None
+        pa(XADES.PostalCode(PP.PostalCode)) if PP.PostalCode else None
+        pa(XADES.CountryName(PP.CountryName)) if PP.CountryName else None
 
         """
         Empty SignatureProductionPlaceV2 qualifying properties shall not be generated.
         """
+        pp_elements = self._clean_elements_from_black_list(pp_elements)
         if self.xades_legacy and pp_elements:
-            elements.append(XADES132.SignatureProductionPlace(*pp_elements))  # deprecated (legacy)
+            elements.append(XADES.SignatureProductionPlace(*pp_elements))  # deprecated (legacy)
         elif pp_elements:
-            elements.append(XADES132.SignatureProductionPlaceV2(*pp_elements))
+            elements.append(XADES.SignatureProductionPlaceV2(*pp_elements))
+
+        # Item 4: SignaturePolicyIdentifier
+        """
+        The SignaturePolicyIdentifier qualifying property shall be a signed
+            qualifying property qualifying the signature.
+        The SignaturePolicyIdentifier qualifying property shall contain either
+            an explicit identifier of a signature policy or an indication that
+            there is an implied signature policy that the relying party should
+            be aware of.
+
+        ETSI TS 119 172-1 specifies a framework for signature policies.
+        """
+        spid_elements = []
+        sp = options_struct.SignaturePolicy
+        # digest method
+        pdm = self.known_digest_tags.get(self.digest_alg)
+        # digest value
+        pv = resolve_uri(sp.Identifier)
+        
+        spid_elements.append(
+            XADES.SigPolicyId(
+                XADES.Identifier(sp.Identifier),
+                XADES.Description(sp.Description)
+            )
+        )
+        spid_elements.append(
+            XADES.SigPolicyHash(
+                DS.DigestMethod(Algorithm=pdm),
+                DS.DigestValue(
+                    self._get_digest(pv,self._get_digest_method_by_tag(self.digest_alg))
+                )
+            )
+        )
+        spid = XADES.SignaturePolicyId(*spid_elements)
+        spi_elements = []
+        spi_elements.append(spid)
+        elements.append(XADES.SignaturePolicyIdentifier(*spi_elements))
 
         # Item 5: SignerRole or SignerRoleV2
         """
@@ -422,7 +445,7 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
                     "Role types different than strings, although permitted by "
                     "the schema, are not implemented. Use a placeholder and "
                     "post process the resulting element tree, instead!")
-            clr_elements.append(XADES132.ClaimedRole(role))
+            clr_elements.append(XADES.ClaimedRole(role))
 
         ctr_elements = []
         """
@@ -444,11 +467,11 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
                 "EncapsulatedPKIDataType are not implemented.")
 
         for role in options_struct.CertifiedRoles:
-            ctr_elements.append(XADES132.CertifiedRolesV2(
-                XADES132.X509AttributeCertificate(
+            ctr_elements.append(XADES.CertifiedRolesV2(
+                XADES.X509AttributeCertificate(
                     self._get_cert_encoded(role.X509AttributeCertificate)
                 ) if role.X509AttributeCertificate else
-                XADES132.OtherAttributeCertificate(
+                XADES.OtherAttributeCertificate(
                     self._get_cert_encoded(role.OtherAttributeCertificate)
                 )
             ))
@@ -467,44 +490,46 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
 
         sr_elements = []
         if clr_elements:
-            sr_elements.append(XADES132.ClaimedRoles(*clr_elements))
+            sr_elements.append(XADES.ClaimedRoles(*clr_elements))
 
         if ctr_elements and self.xades_legacy:
             raise  # already cached above, never hit
         elif ctr_elements:
-            sr_elements.append(XADES132.CertifiedRolesV2(*clr_elements))
+            sr_elements.append(XADES.CertifiedRolesV2(*ctr_elements))
 
         if sas_elements and not self.xades_legacy:
-            sr_elements.append(XADES132.SignedAssertions(*sas_elements))
+            sr_elements.append(XADES.SignedAssertions(*sas_elements))
 
         """
         Empty SignerRoleV2 qualifying properties shall not be generated.
         """
         if not sr_elements:
             pass
-        elif self.xades_legacy:
-            elements.append(XADES132.SignerRole(*sr_elements))  # deprecated (legacy)
         else:
-            elements.append(XADES132.SignerRoleV2(*sr_elements))
+            sr_elements = self._clean_elements_from_black_list(sr_elements)
+            if self.xades_legacy:
+                elements.append(XADES.SignerRole(*sr_elements))  # deprecated (legacy)
+            else:
+                elements.append(XADES.SignerRoleV2(*sr_elements))
 
         # any ##other
 
-        return elements
+        return self._clean_elements_from_black_list(elements)
 
     def _generate_xades_sdop_elements(self, options_struct):
         elements = []
 
-        elements.append(XADES132.DataObjectFormat())
+        elements.append(XADES.DataObjectFormat())
 
-        elements.append(XADES132.CommitmentTypeIndication())
+        elements.append(XADES.CommitmentTypeIndication())
 
-        elements.append(XADES132.AllDataObjectsTimeStamp())
+        elements.append(XADES.AllDataObjectsTimeStamp())
 
-        elements.append(XADES132.IndividualDataObjectsTimeStamp())
+        elements.append(XADES.IndividualDataObjectsTimeStamp())
 
         # any ##other
 
-        return elements
+        return self._clean_elements_from_black_list(elements)
 
     def _generate_xades_usp_elements(self, options_struct):
         """
@@ -512,54 +537,54 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
         """
         elements = []
 
-        elements.append(XADES132.CounterSignature())
+        elements.append(XADES.CounterSignature())
 
-        elements.append(XADES132.SignatureTimeStamp())
+        elements.append(XADES.SignatureTimeStamp())
 
         if self.xades_legacy:
-            elements.append(XADES132.CompleteCertificateRefs())  # deprecated (legacy)
+            elements.append(XADES.CompleteCertificateRefs())  # deprecated (legacy)
         else:
             elements.append(XADES141.CompleteCertificateRefsV2())
 
-        elements.append(XADES132.CompleteRevocationRefs())
+        elements.append(XADES.CompleteRevocationRefs())
 
         if self.xades_legacy:
-            elements.append(XADES132.AttributeCertificateRefs())  # deprecated (legacy)
+            elements.append(XADES.AttributeCertificateRefs())  # deprecated (legacy)
         else:
             elements.append(XADES141.AttributeCertificateRefsV2())
 
-        elements.append(XADES132.AttributeRevocationRefs())
+        elements.append(XADES.AttributeRevocationRefs())
 
         if self.xades_legacy:
-            elements.append(XADES132.SigAndRefsTimeStamp())  # deprecated (legacy)
+            elements.append(XADES.SigAndRefsTimeStamp())  # deprecated (legacy)
         else:
             elements.append(XADES141.SigAndRefsTimeStampV2())
 
         if self.xades_legacy:
-            elements.append(XADES132.RefsOnlyTimeStamp())  # deprecated (legacy)
+            elements.append(XADES.RefsOnlyTimeStamp())  # deprecated (legacy)
         else:
             elements.append(XADES141.RefsOnlyTimeStampV2())
 
-        elements.append(XADES132.CertificateValues())
+        elements.append(XADES.CertificateValues())
 
-        elements.append(XADES132.RevocationValues())
+        elements.append(XADES.RevocationValues())
 
-        elements.append(XADES132.AttrAuthoritiesCertValues())
+        elements.append(XADES.AttrAuthoritiesCertValues())
 
-        elements.append(XADES132.AttributeRevocationValues())
+        elements.append(XADES.AttributeRevocationValues())
 
-        elements.append(XADES132.ArchiveTimeStamp())
+        elements.append(XADES.ArchiveTimeStamp())
 
         # any ##other
 
-        return elements
+        return self._clean_elements_from_black_list(elements)
 
     def _generate_xades_udop_elements(self, options_struct):
         elements = []
 
-        elements.append(XADES132.UnsignedDataObjectProperty())
+        elements.append(XADES.UnsignedDataObjectProperty())
 
-        return elements
+        return self._clean_elements_from_black_list(elements)
 
     def _generate_xades(self, options_struct):
 
@@ -623,8 +648,8 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
             The Id attribute shall be used to reference the SignedSignatureProperties element.
             """
             sp_elements.append(
-                XADES132.SignedSignatureProperties(
-                    *ssp_elements, Id=_gen_id(self.prefix, "signedsigprops")  # optional
+                XADES.SignedSignatureProperties(
+                    *ssp_elements, Id=_gen_id(self.dsig_prefix, "signedsigprops")  # optional
                 )
             )
         """
@@ -635,8 +660,8 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
             The Id attribute shall be used to reference the SignedDataObjectProperties element.
             """
             sp_elements.append(
-                XADES132.SignedDataObjectProperties(
-                    *sdop_elements, Id=_gen_id(self.prefix, "signeddataobjprops")  # optional
+                XADES.SignedDataObjectProperties(
+                    *sdop_elements, Id=_gen_id(self.dsig_prefix, "signeddataobjprops")  # optional
                 )
             )
 
@@ -649,9 +674,9 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
             """
             The Id attribute shall be used to reference the UnignedSignatureProperties element.
             """
-            usp_elements.append(
-                XADES132.UnsignedSignatureProperties(
-                    *usp_elements, Id=_gen_id(self.prefix, "unsignedsigprops")  # optional
+            up_elements.append(
+                XADES.UnsignedSignatureProperties(
+                    *usp_elements, Id=_gen_id(self.dsig_prefix, "unsignedsigprops")  # optional
                 )
             )
         """
@@ -662,8 +687,8 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
             The Id attribute shall be used to reference the UnignedDataObjectProperties element.
             """
             usp_elements.append(
-                XADES132.UnsignedDataObjectProperties(
-                    *udop_elements, Id=_gen_id(self.prefix, "unsigneddataobjprops")  # optional
+                XADES.UnsignedDataObjectProperties(
+                    *udop_elements, Id=_gen_id(self.dsig_prefix, "unsigneddataobjprops")  # optional
                 )
             )
 
@@ -677,8 +702,9 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
             """
             The Id attribute shall be used to reference the SignedProperties element.
             """
-            sp = XADES132.SignedProperties(*sp_elements,
-                    Id=_gen_id(self.prefix, "signedprops")  # optional
+            sp_elements = self._clean_elements_from_black_list(sp_elements)
+            sp = XADES.SignedProperties(*sp_elements,
+                    Id=_gen_id(self.dsig_prefix, "signedprops")  # optional
             )
             qp_elements.append(sp)
             """
@@ -693,8 +719,7 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
             This ds:Reference element shall include the Type attribute with its
             value set to:
             """
-
-            self._add_xades_reference(sp)
+            self._add_xades_reference(sp, {"Type": "http://uri.etsi.org/01903#SignedProperties"})
 
         """
         A XAdES signature shall not incorporate empty UnsignedProperties elements.
@@ -703,9 +728,10 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
             """
             The Id attribute shall be used to reference the UnsignedProperties element.
             """
+            up_elements = self._clean_elements_from_black_list(up_elements)
             qp_elements.append(
-                XADES132.UnsignedProperties(*up_elements,
-                    Id=_gen_id(self.prefix, "unsignedprops")  # optional
+                XADES.UnsignedProperties(*up_elements,
+                    Id=_gen_id(self.dsig_prefix, "unsignedprops")  # optional
                 )
             )
 
@@ -715,8 +741,8 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
         the QualifyingProperties container.
         """
         qp_attributes = {
-            "Target": '',  # required
-            "Id": _gen_id(self.prefix, "qualifyingprops"),  # optional
+            "Target": "#"+_gen_id(self.dsig_prefix,"signature"),  # required
+            "Id": _gen_id(self.dsig_prefix, "qualifyingprops"),  # optional
         }
 
         """
@@ -724,8 +750,11 @@ class XAdESSigner(XAdESProcessor, XMLSigner):
         """
         if not qp_elements:
             return None
-        return XADES132.QualifyingProperties(*qp_elements, **qp_attributes)
-
+        qp_elements = self._clean_elements_from_black_list(qp_elements)
+        qp = XADES.QualifyingProperties(*qp_elements, **qp_attributes)
+        self._add_xades_reference(qp)
+        return qp
+      
 
 class XAdESEPESSigner(XAdESSigner):
 
